@@ -25,7 +25,7 @@ struct ksu_inline_hook {
 };
 
 void *ksu_inline_hook_arch_normalize_target(void *target);
-size_t ksu_inline_hook_arch_patch_size(void);
+size_t ksu_inline_hook_arch_patch_size(void *target);
 int ksu_inline_hook_arch_make_branch(void *to, u8 *patch, size_t patch_size);
 int ksu_inline_hook_arch_prepare(struct ksu_inline_hook *hook, u8 *patch, size_t patch_size);
 void ksu_inline_hook_arch_release(struct ksu_inline_hook *hook);

@@ -10,12 +10,27 @@
 #include "hook/patch_memory.h"
 #include "klog.h"
 
+static __always_inline bool ksu_inline_hook_should_bypass(void)
+{
+#ifdef CONFIG_KSU_TRACEPOINT_HOOK
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
+    return !test_task_syscall_work(current, SYSCALL_TRACEPOINT);
+#else
+    return !test_tsk_thread_flag(current, TIF_SYSCALL_TRACEPOINT);
+#endif
+#else
+    return ksu_is_current_proc_unprivillege();
+#endif
+}
+
 void *ksu_inline_hook_before(struct ksu_inline_hook *hook, unsigned long *arg_regs)
 {
     struct pt_regs regs;
 
     if (!hook)
         return NULL;
+    if (ksu_inline_hook_should_bypass())
+        goto out;
 
     if (!hook->before)
         goto out;
@@ -36,6 +51,8 @@ unsigned long ksu_inline_hook_after(struct ksu_inline_hook *hook, unsigned long 
     struct pt_regs regs;
 
     if (!hook)
+        return ret;
+    if (ksu_inline_hook_should_bypass())
         return ret;
 
     if (!hook->after)
@@ -66,6 +83,8 @@ unsigned long ksu_inline_hook_entry_dispatch(struct ksu_inline_hook *hook, unsig
         return 0;
 
     clone = (ksu_inline_clone_fn_t)(hook->clone ?: (void *)((unsigned long)hook->target + hook->patch_size));
+    if (ksu_inline_hook_should_bypass())
+        goto orig;
 
     if (hook->before)
         clone = (ksu_inline_clone_fn_t)ksu_inline_hook_before(hook, args);
@@ -76,6 +95,8 @@ unsigned long ksu_inline_hook_entry_dispatch(struct ksu_inline_hook *hook, unsig
         ret = ksu_inline_hook_after(hook, ret, args);
 
     return ret;
+orig:
+    return clone(args[0], args[1], args[2], args[3], args[4], args[5], args[6]);
 }
 
 struct ksu_inline_hook *ksu_inline_hook_register(const struct ksu_inline_hook_config config)
@@ -89,7 +110,8 @@ struct ksu_inline_hook *ksu_inline_hook_register(const struct ksu_inline_hook_co
     if (!config.target || (!config.before && !config.after))
         return ERR_PTR(-EINVAL);
 
-    patch_size = ksu_inline_hook_arch_patch_size();
+    target = ksu_inline_hook_arch_normalize_target(config.target);
+    patch_size = ksu_inline_hook_arch_patch_size(target);
     if (!patch_size || patch_size > sizeof(patch))
         return ERR_PTR(-EOPNOTSUPP);
 
@@ -97,7 +119,6 @@ struct ksu_inline_hook *ksu_inline_hook_register(const struct ksu_inline_hook_co
     if (!hook)
         return ERR_PTR(-ENOMEM);
 
-    target = ksu_inline_hook_arch_normalize_target(config.target);
     hook->target = target;
     hook->before = config.before;
     hook->after = config.after;

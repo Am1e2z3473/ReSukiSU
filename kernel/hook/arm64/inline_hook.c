@@ -265,8 +265,9 @@ void *ksu_inline_hook_arch_normalize_target(void *target)
     return target;
 }
 
-size_t ksu_inline_hook_arch_patch_size(void)
+size_t ksu_inline_hook_arch_patch_size(void *target)
 {
+    (void)target;
     return KSU_INLINE_PATCH_SIZE;
 }
 
@@ -322,6 +323,33 @@ static int ksu_inline_hook_arch_make_direct_branch(void *from, void *to, u8 *pat
         if (!*insn)
             *insn = KSU_AARCH64_NOP;
     }
+
+    return 0;
+}
+
+/*
+ * Resume in the middle of the original function with a direct branch.
+ *
+ * On a BTI-enabled kernel, the core kernel text is mapped as guarded.  An
+ * indirect BR into target + patch_size would therefore require a landing pad
+ * there, which normal function bodies do not have.
+ */
+static int ksu_inline_make_rejoin_branch(void *from, void *to, u8 *patch, size_t patch_size)
+{
+    u32 *insn = (u32 *)patch;
+    size_t i;
+    int ret;
+
+    if (patch_size != KSU_INLINE_PATCH_SIZE)
+        return -EINVAL;
+
+    memset(patch, 0, patch_size);
+    ret = ksu_inline_encode_branch(KSU_AARCH64_B, (unsigned long)from, (unsigned long)to, &insn[0]);
+    if (ret)
+        return ret;
+
+    for (i = 1; i < patch_size / sizeof(*insn); i++)
+        insn[i] = KSU_AARCH64_NOP;
 
     return 0;
 }
@@ -851,10 +879,17 @@ static int ksu_inline_build_reinsn(struct ksu_inline_hook *hook, unsigned long c
         memcpy((void *)(new_pc + i), &relocated, sizeof(relocated));
     }
 
-    ret = ksu_inline_hook_arch_make_branch((void *)((unsigned long)hook->target + hook->patch_size),
-                                           (u8 *)(clone + hook->patch_size), hook->patch_size);
-    if (ret)
+    ret = ksu_inline_make_rejoin_branch((void *)(clone + hook->patch_size),
+                                        (void *)((unsigned long)hook->target + hook->patch_size),
+                                        (u8 *)(clone + hook->patch_size), hook->patch_size);
+    if (ret == -ERANGE && !IS_ENABLED(CONFIG_ARM64_BTI_KERNEL))
+        ret = ksu_inline_hook_arch_make_branch((void *)((unsigned long)hook->target + hook->patch_size),
+                                               (u8 *)(clone + hook->patch_size), hook->patch_size);
+    if (ret) {
+        if (ret == -ERANGE && IS_ENABLED(CONFIG_ARM64_BTI_KERNEL))
+            pr_err("inline_hook: BTI rejoin branch out of range target=%px clone=%px\n", hook->target, (void *)clone);
         return ret;
+    }
 
     *veneer_cursor = ctx.veneer_cursor;
     return 0;
@@ -917,6 +952,12 @@ int ksu_inline_hook_arch_prepare(struct ksu_inline_hook *hook, u8 *patch, size_t
                            KSU_INLINE_ENTRY_SIZE + 15);
     code = ksu_inline_hook_code_alloc(hook->target, code_size, true);
     if (!code) {
+        if (IS_ENABLED(CONFIG_ARM64_BTI_KERNEL)) {
+            pr_err("inline_hook: BTI requires near reinsn allocation target=%px (%pS) size=%zu\n", hook->target,
+                   hook->target, code_size);
+            return -ENOMEM;
+        }
+
         pr_warn("inline_hook: near reinsn alloc failed target=%px (%pS) size=%zu, fallback to far reinsn\n",
                 hook->target, hook->target, code_size);
         code = ksu_inline_hook_code_alloc(hook->target, code_size, false);

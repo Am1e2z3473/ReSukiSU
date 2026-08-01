@@ -334,3 +334,23 @@ ifeq ($(shell grep -q "do_execveat_common" $(srctree)/fs/exec.c; echo $$?),0)
 $(info -- $(REPO_NAME)/compat: found do_execveat_common)
 ccflags-y += -DKSU_COMPAT_HAVE_DO_EXECVEAT_COMMON
 endif
+
+ifeq ($(shell grep -Fq 'struct pcpu_hot' $(srctree)/arch/x86/include/asm/current.h 2>/dev/null; echo $$?),0)
+$(info -- $(REPO_NAME)/compat: found x86 current_in_pcpu_hot)
+ccflags-y += -DKSU_COMPAT_X86_CURRENT_IN_PCPU_HOT
+endif
+
+ifeq ($(shell grep -Fq 'end_kaddr' $(srctree)/arch/x86/include/asm/insn.h 2>/dev/null; echo $$?),0)
+$(info -- $(REPO_NAME)/compat: found x86 insn has end_kaddr)
+ccflags-y += -DKSU_COMPAT_X86_INSN_HAS_END_KADDR
+endif
+
+ifeq ($(shell grep -Fq 'emulate_prefix_size' $(srctree)/arch/x86/include/asm/insn.h 2>/dev/null; echo $$?),0)
+$(info -- $(REPO_NAME)/compat: found x86 insn has emulate_prefix_size)
+ccflags-y += -DKSU_COMPAT_X86_INSN_HAS_EMULATE_PREFIX
+endif
+
+ifeq ($(shell grep -Fq 'return (struct thread_info *)(sp & ~(THREAD_SIZE - 1));' $(srctree)/arch/arm64/include/asm/thread_info.h 2>/dev/null; echo $$?),0)
+$(info -- $(REPO_NAME)/compat: found arm64 thread_info by sp)
+ccflags-y += -DKSU_COMPAT_ARM64_THREAD_INFO_BY_SP
+endif
