@@ -54,6 +54,10 @@
 #define KSU_AARCH64_MRS_X16_SP_EL0 0xd5384110
 #define KSU_AARCH64_LDR_X16_X16 0xf9400210
 #define KSU_AARCH64_MOV_X16_SP 0x910003f0
+#define KSU_AARCH64_MOV_X6_X0 0xaa0003e6
+#define KSU_AARCH64_LDP_X0_X1_X6 0xa94004c0
+#define KSU_AARCH64_LDP_X2_X3_X6_16 0xa9410cc2
+#define KSU_AARCH64_LDP_X4_X5_X6_32 0xa94214c4
 #define KSU_AARCH64_AND_X16_X16_X17 0x8a110210
 #define KSU_AARCH64_TBNZ_X16_TIF_PROC_NON_PRIVILEGE                                                                    \
     (0x37000010 | ((TIF_PROC_NON_PRIVILEGE & 0x20) << 26) | ((TIF_PROC_NON_PRIVILEGE & 0x1f) << 19))
@@ -68,30 +72,6 @@
     (LINUX_VERSION_CODE < KERNEL_VERSION(4, 5, 0) || defined(KSU_COMPAT_ARM64_THREAD_INFO_BY_SP))
 #define KSU_ARM64_THREAD_INFO_BY_SP
 #endif
-
-typedef unsigned long (*ksu_inline_arm64_clone_fn_t)(unsigned long, unsigned long, unsigned long, unsigned long,
-                                                     unsigned long, unsigned long, unsigned long, unsigned long);
-
-static unsigned long __nocfi noinline ksu_inline_hook_arm64_entry_dispatch(unsigned long arg0, unsigned long arg1,
-                                                                           unsigned long arg2, unsigned long arg3,
-                                                                           unsigned long arg4, unsigned long arg5,
-                                                                           unsigned long arg6, unsigned long arg7)
-{
-    struct ksu_inline_hook *hook;
-    unsigned long args[] = { arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7, 0 };
-    ksu_inline_arm64_clone_fn_t clone;
-    unsigned long ret;
-
-    asm volatile("mov %0, x16" : "=r"(hook));
-
-    if (!hook)
-        return 0;
-
-    clone = (ksu_inline_arm64_clone_fn_t)ksu_inline_hook_before(hook, args);
-    ret = clone(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]);
-
-    return ksu_inline_hook_after(hook, ret, args);
-}
 
 static void ksu_inline_dump_target(const char *reason, struct ksu_inline_hook *hook, unsigned long size)
 {
@@ -354,35 +334,6 @@ static int ksu_inline_make_rejoin_branch(void *from, void *to, u8 *patch, size_t
     return 0;
 }
 
-unsigned long ksu_inline_hook_arch_get_ret(const struct pt_regs *regs)
-{
-    return regs->regs[0];
-}
-
-#define KSU_INLINE_HOOK_ARG_REGS_NR 9
-
-void ksu_inline_hook_arch_setup_regs(struct pt_regs *regs, unsigned long *arg_regs)
-{
-    if (!arg_regs)
-        return;
-
-    memcpy(regs->regs, arg_regs, KSU_INLINE_HOOK_ARG_REGS_NR * sizeof(regs->regs[0]));
-    regs->orig_x0 = arg_regs[0];
-}
-
-void ksu_inline_hook_arch_update_args(const struct pt_regs *regs, unsigned long *arg_regs)
-{
-    if (!arg_regs)
-        return;
-
-    memcpy(arg_regs, regs->regs, KSU_INLINE_HOOK_ARG_REGS_NR * sizeof(arg_regs[0]));
-}
-
-void ksu_inline_hook_arch_set_ret(struct pt_regs *regs, unsigned long ret)
-{
-    regs->regs[0] = ret;
-}
-
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0) || defined(KSU_COMPAT_MODULE_ALLOC_BASE_IN_MODULE_C)
 // https://github.com/torvalds/linux/commit/e46b7103aef39c3f421f0bff7a10ae5a29cd5cee
 static u64 ksu_module_alloc_base;
@@ -549,25 +500,21 @@ static inline void *ksu_inline_hook_code_alloc(void *target, size_t size, bool n
 static int ksu_inline_make_entry_stub(struct ksu_inline_hook *hook, void *buf)
 {
     u32 *insn = buf;
-    unsigned long hook_literal;
     unsigned long dispatcher_literal;
     unsigned long stack_mask_literal;
     unsigned long clone_literal;
     u32 *fast_branch = NULL;
     u64 stack_mask = ~((u64)THREAD_SIZE - 1);
-    u64 hook_addr = (u64)hook;
-    u64 dispatcher = (u64)ksu_inline_hook_arm64_entry_dispatch;
+    u64 dispatcher = (u64)hook->dispatcher;
     u64 clone_addr = (u64)hook->clone;
     int ret;
 
     memset(buf, 0, KSU_INLINE_ENTRY_SIZE);
 
-    // +64: .Lhook
-    // +72: .Ldispatcher
-    // +80: .Lstack_mask
-    // +88: .Lclone
-    hook_literal = (unsigned long)buf + 64;
-    dispatcher_literal = hook_literal + sizeof(u64);
+    // +64: .Ldispatcher
+    // +72: .Lstack_mask
+    // +80: .Lclone
+    dispatcher_literal = (unsigned long)buf + 64;
     stack_mask_literal = dispatcher_literal + sizeof(u64);
     clone_literal = stack_mask_literal + sizeof(u64);
 
@@ -600,29 +547,30 @@ static int ksu_inline_make_entry_stub(struct ksu_inline_hook *hook, void *buf)
     // init it later, because we need know the address of .Lfast
     fast_branch = insn++;
 
-    // ldr x16, .Lhook
-    ret = ksu_inline_encode_ldr_literal(16, (unsigned long)insn, hook_literal, insn);
+    if (hook->abi == KSU_INLINE_HOOK_ABI_ARM64_SYSCALL) {
+        /*
+         * The arm64 syscall wrapper receives one pointer in x0.  Expose the
+         * six syscall arguments as the original x0-x5 values without making
+         * a pt_regs copy.  x6 keeps the original frame and x7 carries clone.
+         */
+        *insn++ = KSU_AARCH64_MOV_X6_X0;
+        *insn++ = KSU_AARCH64_LDP_X0_X1_X6;
+        *insn++ = KSU_AARCH64_LDP_X2_X3_X6_16;
+        *insn++ = KSU_AARCH64_LDP_X4_X5_X6_32;
+
+        ret = ksu_inline_encode_ldr_literal(7, (unsigned long)insn, clone_literal, insn);
+        if (ret)
+            return ret;
+        insn++;
+    }
+
+    // ldr x16, .Ldispatcher
+    // br  x16
+    ret = ksu_inline_encode_ldr_literal(16, (unsigned long)insn, dispatcher_literal, insn);
     if (ret)
         return ret;
     insn++;
-
-    if (ksu_inline_branch_in_range((unsigned long)insn, (unsigned long)ksu_inline_hook_arm64_entry_dispatch)) {
-        // b ksu_inline_hook_arm64_entry_dispatch
-        ret = ksu_inline_encode_branch(KSU_AARCH64_B, (unsigned long)insn,
-                                       (unsigned long)ksu_inline_hook_arm64_entry_dispatch, insn);
-        if (ret)
-            return ret;
-        insn++;
-    } else {
-        // ldr x17, .Ldispatcher
-        // br x17
-        ret = ksu_inline_encode_ldr_literal(17, (unsigned long)insn, dispatcher_literal, insn);
-        if (ret)
-            return ret;
-        insn++;
-
-        *insn++ = KSU_AARCH64_BR_X17;
-    }
+    *insn++ = KSU_AARCH64_BR_X16;
 
     if (fast_branch) {
         unsigned long fast_label = (unsigned long)insn;
@@ -654,17 +602,14 @@ static int ksu_inline_make_entry_stub(struct ksu_inline_hook *hook, void *buf)
             return ret;
     }
 
-    if ((unsigned long)insn > hook_literal)
+    if ((unsigned long)insn > dispatcher_literal)
         return -ENOSPC;
 
-    while ((unsigned long)insn < hook_literal)
+    while ((unsigned long)insn < dispatcher_literal)
         *insn++ = KSU_AARCH64_NOP;
 
-    // .Lhook:
-    //     .quad hook
-    //
     // .Ldispatcher:
-    //     .quad ksu_inline_hook_arm64_entry_dispatch
+    //     .quad hook->dispatcher
     //
     // .Lstack_mask:
     //     .quad ~(THREAD_SIZE - 1)
@@ -672,7 +617,6 @@ static int ksu_inline_make_entry_stub(struct ksu_inline_hook *hook, void *buf)
     // .Lclone:
     //     .quad hook->clone
     //
-    memcpy((void *)hook_literal, &hook_addr, sizeof(hook_addr));
     memcpy((void *)dispatcher_literal, &dispatcher, sizeof(dispatcher));
     memcpy((void *)stack_mask_literal, &stack_mask, sizeof(stack_mask));
     memcpy((void *)clone_literal, &clone_addr, sizeof(clone_addr));

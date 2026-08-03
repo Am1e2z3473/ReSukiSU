@@ -10,95 +10,6 @@
 #include "hook/patch_memory.h"
 #include "klog.h"
 
-static __always_inline bool ksu_inline_hook_should_bypass(void)
-{
-#ifdef CONFIG_KSU_TRACEPOINT_HOOK
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
-    return !test_task_syscall_work(current, SYSCALL_TRACEPOINT);
-#else
-    return !test_tsk_thread_flag(current, TIF_SYSCALL_TRACEPOINT);
-#endif
-#else
-    return ksu_is_current_proc_unprivillege();
-#endif
-}
-
-void *ksu_inline_hook_before(struct ksu_inline_hook *hook, unsigned long *arg_regs)
-{
-    struct pt_regs regs;
-
-    if (!hook)
-        return NULL;
-    if (ksu_inline_hook_should_bypass())
-        goto out;
-
-    if (!hook->before)
-        goto out;
-
-    ksu_inline_hook_arch_setup_regs(&regs, arg_regs);
-
-    if (!READ_ONCE(hook->unregistering)) {
-        hook->before(&regs);
-        ksu_inline_hook_arch_update_args(&regs, arg_regs);
-    }
-
-out:
-    return hook->clone ?: (void *)((unsigned long)hook->target + hook->patch_size);
-}
-
-unsigned long ksu_inline_hook_after(struct ksu_inline_hook *hook, unsigned long ret, unsigned long *arg_regs)
-{
-    struct pt_regs regs;
-
-    if (!hook)
-        return ret;
-    if (ksu_inline_hook_should_bypass())
-        return ret;
-
-    if (!hook->after)
-        return ret;
-
-    ksu_inline_hook_arch_setup_regs(&regs, arg_regs);
-    ksu_inline_hook_arch_set_ret(&regs, ret);
-
-    if (!READ_ONCE(hook->unregistering)) {
-        hook->after(&regs);
-        ret = ksu_inline_hook_arch_get_ret(&regs);
-    }
-
-    return ret;
-}
-
-unsigned long ksu_inline_hook_entry_dispatch(struct ksu_inline_hook *hook, unsigned long arg0, unsigned long arg1,
-                                             unsigned long arg2, unsigned long arg3, unsigned long arg4,
-                                             unsigned long arg5, unsigned long arg6)
-{
-    typedef unsigned long (*ksu_inline_clone_fn_t)(unsigned long, unsigned long, unsigned long, unsigned long,
-                                                   unsigned long, unsigned long, unsigned long);
-    unsigned long args[] = { arg0, arg1, arg2, arg3, arg4, arg5, arg6, 0, 0 };
-    ksu_inline_clone_fn_t clone;
-    unsigned long ret;
-
-    if (!hook)
-        return 0;
-
-    clone = (ksu_inline_clone_fn_t)(hook->clone ?: (void *)((unsigned long)hook->target + hook->patch_size));
-    if (ksu_inline_hook_should_bypass())
-        goto orig;
-
-    if (hook->before)
-        clone = (ksu_inline_clone_fn_t)ksu_inline_hook_before(hook, args);
-
-    ret = clone(args[0], args[1], args[2], args[3], args[4], args[5], args[6]);
-
-    if (hook->after)
-        ret = ksu_inline_hook_after(hook, ret, args);
-
-    return ret;
-orig:
-    return clone(args[0], args[1], args[2], args[3], args[4], args[5], args[6]);
-}
-
 struct ksu_inline_hook *ksu_inline_hook_register(const struct ksu_inline_hook_config config)
 {
     struct ksu_inline_hook *hook;
@@ -107,10 +18,20 @@ struct ksu_inline_hook *ksu_inline_hook_register(const struct ksu_inline_hook_co
     size_t patch_size;
     int ret;
 
-    if (!config.target || (!config.before && !config.after))
+    if (!config.target || !config.dispatcher || config.abi > KSU_INLINE_HOOK_ABI_ARM64_SYSCALL)
         return ERR_PTR(-EINVAL);
 
+#ifndef __aarch64__
+    if (config.abi == KSU_INLINE_HOOK_ABI_ARM64_SYSCALL)
+        return ERR_PTR(-EOPNOTSUPP);
+#endif
+
     target = ksu_inline_hook_arch_normalize_target(config.target);
+    if (!kernel_text_address((unsigned long)target) || !kernel_text_address((unsigned long)config.dispatcher)) {
+        pr_err("inline_hook: reject non-text target=%px dispatcher=%px\n", target, config.dispatcher);
+        return ERR_PTR(-EINVAL);
+    }
+
     patch_size = ksu_inline_hook_arch_patch_size(target);
     if (!patch_size || patch_size > sizeof(patch))
         return ERR_PTR(-EOPNOTSUPP);
@@ -120,8 +41,8 @@ struct ksu_inline_hook *ksu_inline_hook_register(const struct ksu_inline_hook_co
         return ERR_PTR(-ENOMEM);
 
     hook->target = target;
-    hook->before = config.before;
-    hook->after = config.after;
+    hook->dispatcher = config.dispatcher;
+    hook->abi = config.abi;
     hook->patch_size = patch_size;
     hook->slot = KSU_INLINE_INVALID_SLOT;
     memcpy(hook->orig, target, hook->patch_size);
@@ -130,15 +51,20 @@ struct ksu_inline_hook *ksu_inline_hook_register(const struct ksu_inline_hook_co
     if (ret)
         goto err_free;
 
+    if (config.owner)
+        WRITE_ONCE(*config.owner, hook);
+
     ret = ksu_patch_text(target, patch, patch_size, KSU_PATCH_TEXT_FLUSH_ICACHE);
     if (ret)
         goto err_release;
 
     hook->active = true;
-    pr_info("inline_hook: hooked target=%px before=%px after=%px\n", config.target, config.before, config.after);
+    pr_info("inline_hook: hooked target=%px dispatcher=%px\n", config.target, config.dispatcher);
     return hook;
 
 err_release:
+    if (config.owner && READ_ONCE(*config.owner) == hook)
+        WRITE_ONCE(*config.owner, NULL);
     ksu_inline_hook_arch_release(hook);
 err_free:
     kfree(hook);
