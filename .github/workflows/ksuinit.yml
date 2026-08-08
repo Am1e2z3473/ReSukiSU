@@ -34,7 +34,7 @@ jobs:
       uses: actions/upload-artifact@v7
       with:
         name: ksuinit-aarch64
-        path: target/aarch64-unknown-linux-musl/release/ksuinit
+        path: userspace/ksuinit/target/aarch64-unknown-linux-musl/release/ksuinit
 
     - name: Build ksuinit x64
       run: |
@@ -47,4 +47,4 @@ jobs:
       uses: actions/upload-artifact@v7
       with:
         name: ksuinit-x86_64
-        path: target/x86_64-unknown-linux-musl/release/ksuinit
+        path: userspace/ksuinit/target/x86_64-unknown-linux-musl/release/ksuinit
