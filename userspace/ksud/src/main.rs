@@ -12,7 +12,6 @@ mod boot_patch;
 mod cli_non_android;
 mod defs;
 
-
 fn main() -> anyhow::Result<()> {
     #[cfg(target_os = "android")]
     {
