@@ -26,4 +26,5 @@ fun getGitDescribe(): String {
     return providers.exec {
         commandLine("git", "describe", "--tags", "--always", "--abbrev=0")
     }.standardOutput.asText.get().trim()
+    return "${raw.substringBefore("@")}@EdaxP"
 }
