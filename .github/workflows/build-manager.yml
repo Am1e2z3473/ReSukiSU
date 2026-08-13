@@ -391,3 +391,35 @@ jobs:
           export VERSION=$(git rev-list --count HEAD)
           APK_RELEASE=apk/release/*.apk
           python3 $GITHUB_WORKSPACE/scripts/ksubot.py $APK_RELEASE
+
+  release:
+    needs:
+      - repack-manager
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Manager artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: manager
+          name: "Manager-release"
+      
+      - name: Check is rc tag
+        id: is_rc
+        run: |
+          REF_NAME="${{ github.ref_name }}"
+          if [[ "$REF_NAME" =~ -rc[0-9]+$ ]]; then
+            echo "IS_RC_TAG=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "IS_RC_TAG=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Display structure of downloaded files
+        run: ls -R
+
+      - name: Release
+        uses: softprops/action-gh-release@v3
+        with:
+          prerelease: ${{ steps.is_rc.outputs.IS_RC_TAG == 'true' }}
+          files: |
+            manager/*.apk
